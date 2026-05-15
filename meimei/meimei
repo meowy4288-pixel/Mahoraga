@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Mei Mei — vision model integration for Six Eyes capture output.
+
+Takes raw PNG from stdin (typically piped from `sixeyes capture`),
+base64-encodes it, and POSTs it to any OpenAI-compatible vision API.
+Routes through Mahoraga's Wheel proxy at localhost:8080 by default.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        print("error: Python 3.11+ or `tomli` package required for TOML config", file=sys.stderr)
+        sys.exit(1)
+
+
+CONFIG_PATH = Path.home() / '.config' / 'meimei' / 'config.toml'
+
+DEFAULTS = {
+    'provider': {
+        'api_base': 'http://localhost:8080/v1',
+        'model': 'gpt-4o',
+        'api_key': '',
+    },
+    'defaults': {
+        'max_tokens': 1024,
+        'temperature': 0.7,
+    },
+}
+
+
+def load_config(path=None):
+    path = path or CONFIG_PATH
+
+    if not path.exists():
+        return dict(DEFAULTS)
+
+    try:
+        with open(path, 'rb') as f:
+            config = tomllib.load(f)
+    except Exception as e:
+        print(f"error: failed to parse {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    merged = {}
+    for section, values in DEFAULTS.items():
+        merged[section] = dict(values)
+        if section in config and isinstance(config[section], dict):
+            merged[section].update(config[section])
+
+    for section in config:
+        if section not in merged:
+            merged[section] = config[section]
+
+    return merged
+
+
+def read_image(path=None):
+    if path:
+        with open(path, 'rb') as f:
+            return f.read()
+    return sys.stdin.buffer.read()
+
+
+def build_payload(config, image_data, prompt):
+    b64 = base64.b64encode(image_data).decode('utf-8')
+
+    payload = {
+        'model': config['provider']['model'],
+        'messages': [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': prompt},
+                    {
+                        'type': 'image_url',
+                        'image_url': {
+                            'url': f'data:image/png;base64,{b64}',
+                            'detail': 'auto',
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    defaults = config.get('defaults', {})
+    if 'max_tokens' in defaults and defaults['max_tokens']:
+        payload['max_tokens'] = defaults['max_tokens']
+    if 'temperature' in defaults and defaults['temperature'] is not None:
+        payload['temperature'] = defaults['temperature']
+
+    return payload
+
+
+def send_request(config, payload):
+    api_base = config['provider']['api_base'].rstrip('/')
+    url = f'{api_base}/chat/completions'
+    api_key = config['provider'].get('api_key', '') or ''
+
+    headers = {'Content-Type': 'application/json'}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+            return result['choices'][0]['message']['content']
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        print(f"error: API returned HTTP {e.code}", file=sys.stderr)
+        if body:
+            print(body[:2000], file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        reason = str(e.reason) if hasattr(e, 'reason') else str(e)
+        print(f"error: connection failed: {reason}", file=sys.stderr)
+        print(f"       Is {config['provider']['api_base']} reachable?", file=sys.stderr)
+        print(f"       If using Mahoraga's Wheel, is the container running?", file=sys.stderr)
+        print(f"       Check: docker ps | grep api-proxy", file=sys.stderr)
+        sys.exit(1)
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        print(f"error: unexpected API response format: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Vision model integration for Six Eyes capture output.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              sixeyes capture | meimei "what is happening on screen"
+              meimei -f screenshot.png "describe this ui"
+              meimei -m gpt-4o-mini "explain the game state"
+              sixeyes capture | meimei --api-base https://api.openai.com/v1 "describe"
+            """),
+    )
+    parser.add_argument('prompt', nargs='?', default='Describe this image in detail.',
+                        help='Question about the image (default: "Describe this image in detail.")')
+    parser.add_argument('-f', '--file',
+                        help='Read image from FILE instead of stdin')
+    parser.add_argument('-c', '--config',
+                        help=f'Config path (default: {CONFIG_PATH})')
+    parser.add_argument('-m', '--model',
+                        help='Override model from config')
+    parser.add_argument('-b', '--api-base',
+                        help='Override API base URL from config')
+    parser.add_argument('-k', '--api-key',
+                        help='Override API key from config')
+    parser.add_argument('-t', '--temperature', type=float,
+                        help='Override temperature from config')
+    parser.add_argument('-n', '--max-tokens', type=int,
+                        help='Override max_tokens from config')
+    parser.add_argument('--dry-run',
+                        help='Print the JSON payload instead of sending it (debugging)',
+                        action='store_true')
+
+    args = parser.parse_args()
+
+    config_path = Path(args.config) if args.config else CONFIG_PATH
+    config = load_config(config_path)
+
+    if args.model:
+        config['provider']['model'] = args.model
+    if args.api_base:
+        config['provider']['api_base'] = args.api_base
+    if args.api_key:
+        config['provider']['api_key'] = args.api_key
+
+    image_data = read_image(args.file)
+    if not image_data:
+        print("error: no image data received", file=sys.stderr)
+        print("       pipe sixeyes capture output or use --file", file=sys.stderr)
+        sys.exit(1)
+
+    prompt = args.prompt or 'Describe this image in detail.'
+    payload = build_payload(config, image_data, prompt)
+
+    if args.temperature is not None:
+        payload['temperature'] = args.temperature
+    if args.max_tokens is not None:
+        payload['max_tokens'] = args.max_tokens
+
+    if args.dry_run:
+        print(json.dumps(payload, indent=2))
+        return
+
+    response = send_request(config, payload)
+    print(response)
+
+
+if __name__ == '__main__':
+    main()

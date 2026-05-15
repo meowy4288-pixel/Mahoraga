@@ -1,14 +1,15 @@
 # Mahoraga
 
-**Ephemeral tooling for AI coding agents.** Two standalone components
+**Ephemeral tooling for AI coding agents.** Standalone components
 that together give you a fully isolated, auto-wiping agent session with
-transparent API key rotation.
+transparent API key rotation and permission-based screen access.
 
 ```
 Mahoraga/
 ├── purifier/                          ← Ephemeral sandbox (tmpfs/overlay)
 ├── mahoraga's wheel(apidocker)/        ← API key rotation proxy
 ├── sixeyes/                           ← Permission-based screen access
+├── meimei/                            ← Vision model integration
 └── README.md                          ← This file
 ```
 
@@ -56,12 +57,25 @@ sixeyes status             # show permitted windows
 sixeyes capture            # capture permitted windows → stdout (PNG)
 ```
 
-Supports X11, Hyprland, and Sway. Pairs with Mahoraga's Wheel for key
-management.
+Supports X11, Hyprland, and Sway.
+
+### [meimei](./meimei) — Vision model integration
+
+Takes raw PNG from `sixeyes capture` via stdin, sends it to any
+OpenAI-compatible vision API, and prints the model's response. Routes
+through Mahoraga's Wheel proxy by default. Zero pip dependencies —
+pure Python stdlib.
+
+```
+sixeyes capture | meimei "what is happening on screen"
+meimei -f screenshot.png "describe this ui"
+```
 
 ---
 
 ## Typical workflow
+
+### Coding session (purifier + proxy)
 
 ```bash
 # Terminal 1 — start the key proxy
@@ -80,6 +94,21 @@ purifier exec "aider --model deepseek-chat --api-base http://localhost:8080"
 # When done:
 purifier end               # review diff, promote changes
 docker stop api-proxy      # kill proxy, credit state disappears
+```
+
+### Screen analysis session (sixeyes + meimei + proxy)
+
+```bash
+# Terminal 1 — start the key proxy
+docker run --rm --name api-proxy \
+  -p 8080:8080 \
+  -v ~/.api-keys:/keys:ro \
+  api-proxy
+
+# Terminal 2 — grant access and analyze
+sixeyes free firefox
+sixeyes capture | meimei "summarize this page"
+sixeyes lock firefox  # don't leave windows open
 ```
 
 **Nothing persists.** The sandbox, the proxy, and the screen captures all
@@ -116,4 +145,10 @@ mkdir -p ~/.api-keys
 # ... create .key files ...
 chmod 700 ~/.api-keys
 chmod 600 ~/.api-keys/*.key
+
+# Install sixeyes and meimei for screen-capable agents
+ln -s "$PWD/sixeyes/sixeyes" ~/.local/bin/sixeyes
+ln -s "$PWD/meimei/meimei" ~/.local/bin/meimei
+mkdir -p ~/.config/meimei
+# Edit ~/.config/meimei/config.toml (see meimei/README.md)
 ```
