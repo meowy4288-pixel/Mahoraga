@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PURIFIER_VERSION="0.1.0"
+PURIFIER_ROOT="$(dirname "$(realpath "$0")")"
+LIB_DIR="${PURIFIER_ROOT}/lib"
+
+for lib in common init exec end; do
+    source "${LIB_DIR}/${lib}.sh"
+done
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "${cmd}" in
+        init)       cmd_init "$@" ;;
+        exec)       cmd_exec "$@" ;;
+        end)        cmd_end "$@" ;;
+        list)       cmd_list "$@" ;;
+        status)     cmd_status "$@" ;;
+        setup-sudo) cmd_setup_sudo "$@" ;;
+        help|--help|-h)
+            echo "purifier ${PURIFIER_VERSION} - Ephemeral sandbox for AI coding agents"
+            echo ""
+            echo "Usage:"
+            echo "  purifier init [--timeout <duration>] <project-path>"
+            echo "    Start a new sandbox for the given project."
+            echo ""
+            echo "  purifier exec [--session <id>] <command> [args...]"
+            echo "    Run a command inside an active sandbox."
+            echo ""
+            echo "  purifier end [--session <id>] [--force]"
+            echo "    End a session: shows diff, promotes on approval, wipes on --force."
+            echo ""
+            echo "  purifier list"
+            echo "    List all active sessions."
+            echo ""
+            echo "  purifier status [--session <id>]"
+            echo "    Show details about a session."
+            echo ""
+            echo "  purifier setup-sudo"
+            echo "    Configure passwordless sudo for mount operations."
+            echo ""
+            echo "  purifier help"
+            echo "    Show this message."
+            ;;
+        --version|-V)
+            echo "purifier ${PURIFIER_VERSION}"
+            ;;
+        *)
+            log_error "Unknown command '${cmd}'"
+            echo "Run 'purifier help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
