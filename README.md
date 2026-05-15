@@ -8,6 +8,7 @@ transparent API key rotation.
 Mahoraga/
 ├── purifier/                          ← Ephemeral sandbox (tmpfs/overlay)
 ├── mahoraga's wheel(apidocker)/        ← API key rotation proxy
+├── sixeyes/                           ← Permission-based screen access
 └── README.md                          ← This file
 ```
 
@@ -42,6 +43,22 @@ docker run -d -p 8080:8080 -v ~/.api-keys:/keys:ro api-proxy
 Keys are stored as simple `.key` files in a host directory. The proxy
 never writes to disk. Kill the container and all credit state is gone.
 
+### [sixeyes](./sixeyes) — Permission-based screen access
+
+Default state is **total blindness** — the AI sees nothing. User explicitly
+grants access to named windows only. Captures are held in memory, never
+written to disk, and output as raw PNG ready to POST to any vision API.
+
+```
+sixeyes free youtube       # grant AI access to YouTube windows
+sixeyes lock youtube       # revoke access
+sixeyes status             # show permitted windows
+sixeyes capture            # capture permitted windows → stdout (PNG)
+```
+
+Supports X11, Hyprland, and Sway. Pairs with Mahoraga's Wheel for key
+management.
+
 ---
 
 ## Typical workflow
@@ -65,8 +82,8 @@ purifier end               # review diff, promote changes
 docker stop api-proxy      # kill proxy, credit state disappears
 ```
 
-**Nothing persists.** The sandbox and the proxy both exist in memory only.
-When the session ends, everything goes with it.
+**Nothing persists.** The sandbox, the proxy, and the screen captures all
+exist in memory only. When the session ends, everything goes with it.
 
 ---
 

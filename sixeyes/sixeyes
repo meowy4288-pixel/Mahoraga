@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""Six Eyes — permission-based screen access layer for AI assistants.
+
+Default state is total blindness. AI sees nothing.
+The user explicitly grants access to named windows only.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from io import BytesIO
+from pathlib import Path
+
+try:
+    from PIL import Image
+except ImportError:
+    print("error: python3-pillow required — run: sudo dnf install python3-pillow", file=sys.stderr)
+    sys.exit(1)
+
+
+STATE_DIR = Path.home() / '.local' / 'state' / 'sixeyes'
+STATE_FILE = STATE_DIR / 'permissions.json'
+
+
+def load_permissions():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return []
+
+
+def save_permissions(perms):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(perms, indent=2) + '\n')
+
+
+def detect_server():
+    if 'WAYLAND_DISPLAY' in os.environ:
+        if 'HYPRLAND_INSTANCE_SIGNATURE' in os.environ:
+            return 'hyprland'
+        try:
+            subprocess.run(['swaymsg', '-t', 'get_tree'], capture_output=True, check=True, timeout=3)
+            return 'sway'
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            pass
+        return 'wayland'
+    if os.environ.get('DISPLAY'):
+        return 'x11'
+    return 'unknown'
+
+
+def window_matches(patterns, title):
+    t = title.lower()
+    return any(p.lower() in t for p in patterns)
+
+
+# ── X11 capture ──────────────────────────────────────────────────────────
+
+def capture_x11(patterns):
+    captured = set()
+    images = []
+
+    for pat in patterns:
+        try:
+            result = subprocess.run(
+                ['xdotool', 'search', '--onlyvisible', '--name', pat],
+                capture_output=True, text=True, timeout=5
+            )
+        except FileNotFoundError:
+            print("error: xdotool not found — run: sudo dnf install xdotool", file=sys.stderr)
+            return images
+        except subprocess.TimeoutExpired:
+            continue
+
+        if result.returncode != 0 or not result.stdout.strip():
+            continue
+
+        for wid in result.stdout.strip().splitlines():
+            wid = wid.strip()
+            if not wid or wid in captured:
+                continue
+            captured.add(wid)
+
+            try:
+                cap = subprocess.run(
+                    ['import', '-window', wid, 'png:-'],
+                    capture_output=True, timeout=10
+                )
+            except FileNotFoundError:
+                print("error: ImageMagick import not found — run: sudo dnf install ImageMagick", file=sys.stderr)
+                return images
+            except subprocess.TimeoutExpired:
+                continue
+
+            if cap.returncode == 0 and len(cap.stdout) > 0:
+                try:
+                    img = Image.open(BytesIO(cap.stdout))
+                    img.load()
+                    images.append(img)
+                except Exception:
+                    continue
+
+    return images
+
+
+# ── Hyprland capture ─────────────────────────────────────────────────────
+
+def capture_hyprland(patterns):
+    images = []
+
+    try:
+        result = subprocess.run(
+            ['hyprctl', 'clients', '-j'],
+            capture_output=True, text=True, timeout=5
+        )
+    except FileNotFoundError:
+        print("error: hyprctl not found — are you running Hyprland?", file=sys.stderr)
+        return images
+    except subprocess.TimeoutExpired:
+        return images
+
+    if result.returncode != 0:
+        return images
+
+    try:
+        clients = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return images
+
+    for client in clients:
+        if not client.get('mapped', True):
+            continue
+        title = client.get('title', '') or ''
+        if not window_matches(patterns, title):
+            continue
+        x, y = client['at']
+        w, h = client['size']
+        if w <= 0 or h <= 0:
+            continue
+
+        try:
+            cap = subprocess.run(
+                ['grim', '-g', f'{x},{y} {w}x{h}', '-'],
+                capture_output=True, timeout=10
+            )
+        except FileNotFoundError:
+            print("error: grim not found — run: sudo dnf install grim", file=sys.stderr)
+            return images
+        except subprocess.TimeoutExpired:
+            continue
+
+        if cap.returncode == 0 and len(cap.stdout) > 0:
+            try:
+                img = Image.open(BytesIO(cap.stdout))
+                img.load()
+                images.append(img)
+            except Exception:
+                continue
+
+    return images
+
+
+# ── Sway capture ─────────────────────────────────────────────────────────
+
+def capture_sway(patterns):
+    images = []
+
+    try:
+        result = subprocess.run(
+            ['swaymsg', '-t', 'get_tree'],
+            capture_output=True, text=True, timeout=5
+        )
+    except FileNotFoundError:
+        print("error: swaymsg not found — are you running Sway?", file=sys.stderr)
+        return images
+    except subprocess.TimeoutExpired:
+        return images
+
+    if result.returncode != 0:
+        return images
+
+    try:
+        tree = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return images
+
+    def find_windows(node, found):
+        for child in node.get('nodes', []):
+            find_windows(child, found)
+        for child in node.get('floating_nodes', []):
+            find_windows(child, found)
+        if node.get('type') in ('con', 'floating_con'):
+            name = node.get('name', '') or ''
+            rect = node.get('rect', {})
+            if name and rect.get('width', 0) > 0:
+                if window_matches(patterns, name):
+                    found.append(rect)
+
+    found = []
+    find_windows(tree, found)
+
+    if not found:
+        return images
+
+    for rect in found:
+        try:
+            cap = subprocess.run(
+                ['grim', '-g', f"{rect['x']},{rect['y']} {rect['width']}x{rect['height']}", '-'],
+                capture_output=True, timeout=10
+            )
+        except FileNotFoundError:
+            print("error: grim not found — run: sudo dnf install grim", file=sys.stderr)
+            return images
+        except subprocess.TimeoutExpired:
+            continue
+
+        if cap.returncode == 0 and len(cap.stdout) > 0:
+            try:
+                img = Image.open(BytesIO(cap.stdout))
+                img.load()
+                images.append(img)
+            except Exception:
+                continue
+
+    return images
+
+
+# ── Wayland fallback ─────────────────────────────────────────────────────
+
+def capture_wayland(patterns):
+    compositor = os.environ.get('XDG_CURRENT_DESKTOP', 'unknown')
+    print(f"error: unsupported Wayland compositor ({compositor})", file=sys.stderr)
+    print(f"       Six Eyes supports: X11, Hyprland, Sway", file=sys.stderr)
+    print(f"       Switch to X11 or a supported compositor.", file=sys.stderr)
+    return []
+
+
+# ── Image combination ────────────────────────────────────────────────────
+
+def combine_images(images):
+    if not images:
+        return None
+    if len(images) == 1:
+        return images[0]
+
+    widths = [im.width for im in images]
+    heights = [im.height for im in images]
+    total_h = sum(heights) + 10 * (len(images) - 1)
+    max_w = max(widths)
+
+    combined = Image.new('RGB', (max_w, total_h), (0, 0, 0))
+    y = 0
+    for im in images:
+        combined.paste(im, (0, y))
+        y += im.height + 10
+    return combined
+
+
+# ── CLI commands ─────────────────────────────────────────────────────────
+
+def cmd_capture():
+    perms = load_permissions()
+    if not perms:
+        return
+
+    server = detect_server()
+
+    if server == 'x11':
+        images = capture_x11(perms)
+    elif server == 'hyprland':
+        images = capture_hyprland(perms)
+    elif server == 'sway':
+        images = capture_sway(perms)
+    elif server == 'wayland':
+        images = capture_wayland(perms)
+    else:
+        print("error: no display server detected", file=sys.stderr)
+        sys.exit(1)
+
+    combined = combine_images(images)
+    if combined is None:
+        return
+
+    combined.save(sys.stdout.buffer, format='PNG')
+
+
+def cmd_free(name):
+    if not name:
+        print("usage: sixeyes free <window-name>", file=sys.stderr)
+        sys.exit(1)
+    perms = load_permissions()
+    if name not in perms:
+        perms.append(name)
+        save_permissions(perms)
+        print(f"freed: {name}")
+    else:
+        print(f"already freed: {name}")
+
+
+def cmd_lock(name):
+    if not name:
+        print("usage: sixeyes lock <window-name>", file=sys.stderr)
+        print("       sixeyes lock --all", file=sys.stderr)
+        sys.exit(1)
+    perms = load_permissions()
+    if name == '--all':
+        save_permissions([])
+        print("locked all — AI is blind")
+        return
+    if name in perms:
+        perms.remove(name)
+        save_permissions(perms)
+        print(f"locked: {name}")
+    else:
+        print(f"not freed: {name}")
+
+
+def cmd_status():
+    perms = load_permissions()
+    if not perms:
+        print("no windows freed — AI is blind")
+        return
+
+    print(f"freed windows ({len(perms)}):")
+
+    server = detect_server()
+
+    if server == 'x11':
+        for pat in perms:
+            try:
+                r = subprocess.run(
+                    ['xdotool', 'search', '--onlyvisible', '--name', pat],
+                    capture_output=True, text=True, timeout=3
+                )
+            except FileNotFoundError:
+                print(f"  {pat}")
+                continue
+            except subprocess.TimeoutExpired:
+                print(f"  {pat}  (timeout)")
+                continue
+
+            if r.returncode == 0 and r.stdout.strip():
+                wids = r.stdout.strip().splitlines()
+                print(f"  {pat}  ->  {len(wids)} window(s) visible")
+            else:
+                print(f"  {pat}  ->  no matching window open")
+
+    elif server == 'hyprland':
+        titles = []
+        try:
+            r = subprocess.run(['hyprctl', 'clients', '-j'], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                clients = json.loads(r.stdout)
+                titles = [c.get('title', '') for c in clients if c.get('mapped', True)]
+        except Exception:
+            pass
+
+        for pat in perms:
+            matching = [t for t in titles if window_matches([pat], t)]
+            if matching:
+                print(f"  {pat}  ->  {len(matching)} window(s):")
+                for t in matching:
+                    print(f"      - {t}")
+            else:
+                print(f"  {pat}  ->  no matching window open")
+
+    elif server == 'sway':
+        titles = []
+        try:
+            r = subprocess.run(['swaymsg', '-t', 'get_tree'], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                tree = json.loads(r.stdout)
+
+                def collect_titles(node):
+                    ts = []
+                    for n in node.get('nodes', []):
+                        ts.extend(collect_titles(n))
+                    for n in node.get('floating_nodes', []):
+                        ts.extend(collect_titles(n))
+                    if node.get('type') in ('con', 'floating_con') and node.get('name'):
+                        ts.append(node['name'])
+                    return ts
+
+                titles = collect_titles(tree)
+        except Exception:
+            pass
+
+        for pat in perms:
+            matching = [t for t in titles if window_matches([pat], t)]
+            if matching:
+                print(f"  {pat}  ->  {len(matching)} window(s):")
+                for t in matching:
+                    print(f"      - {t}")
+            else:
+                print(f"  {pat}  ->  no matching window open")
+
+    else:
+        for pat in perms:
+            print(f"  {pat}")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print(__doc__)
+        print()
+        print("commands:")
+        print("  sixeyes free <name>     Grant AI access to a window by name")
+        print("  sixeyes lock <name>     Revoke access")
+        print("  sixeyes lock --all      Revoke all access")
+        print("  sixeyes status          Show permitted windows")
+        print("  sixeyes capture         Capture permitted windows -> stdout (PNG)")
+        print()
+        print("windows are matched by case-insensitive substring against window titles.")
+        print("state persists in ~/.local/state/sixeyes/permissions.json")
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == 'free':
+        cmd_free(' '.join(args))
+    elif cmd == 'lock':
+        cmd_lock(' '.join(args))
+    elif cmd == 'status':
+        cmd_status()
+    elif cmd == 'capture':
+        cmd_capture()
+    else:
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
